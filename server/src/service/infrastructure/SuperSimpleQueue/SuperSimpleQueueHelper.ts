@@ -168,15 +168,95 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 					});
 				}
 
-				// Step 7. Handle incidents (best effort, don't wait)
-				this.incidentService.handleIncident(statusChangeResult.monitor, statusChangeResult.code, decision, status).catch((error: unknown) => {
-					this.logger.warn({
-						message: `Error handling incident for job ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
-						service: SERVICE_NAME,
-						method: "getMonitorJob",
-						stack: error instanceof Error ? error.stack : undefined,
-					});
+				// Step 7. Handle incidents before escalation checks to avoid race conditions.
+				let activeIncident = null;
+				if (decision.shouldCreateIncident || decision.shouldResolveIncident) {
+					try {
+						activeIncident = await this.incidentService.handleIncident(statusChangeResult.monitor, statusChangeResult.code, decision, status);
+					} catch (error: unknown) {
+						this.logger.warn({
+							message: `Error handling incident for job ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+							service: SERVICE_NAME,
+							method: "getMonitorJob",
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					}
+				}
+
+				// Step 8. Handle escalated notifications (best effort, non-blocking)
+				const updatedMonitor = statusChangeResult.monitor;
+				const hasEscalation =
+					(updatedMonitor.escalatedNotifications ?? []).length > 0;
+
+				this.logger.debug({
+					message: `[Escalation] monitor=${monitorId} status=${updatedMonitor.status} hasEscalation=${hasEscalation} escalatedIds=${JSON.stringify(updatedMonitor.escalatedNotifications)} sentAt=${updatedMonitor.escalationSentAt}`,
+					service: SERVICE_NAME,
+					method: "getHeartbeatJob",
 				});
+
+				if (hasEscalation) {
+					if (updatedMonitor.status === "down" || updatedMonitor.status === "breached") {
+						// Reset escalationSentAt when monitor just went down (fresh incident)
+						if (decision.shouldCreateIncident) {
+							this.monitorsRepository.updateById(monitorId, teamId, { escalationSentAt: null }).catch(() => {});
+						}
+						// Only fire escalated notification if not already sent for this incident
+						if (!updatedMonitor.escalationSentAt) {
+							try {
+								let incident = activeIncident ?? (await this.incidentsRepository.findActiveByMonitorId(monitorId, teamId));
+
+								if (!incident && (updatedMonitor.status === "down" || updatedMonitor.status === "breached")) {
+									const fallbackDecision: MonitorActionDecision = {
+										shouldCreateIncident: true,
+										shouldResolveIncident: false,
+										shouldSendNotification: false,
+										incidentReason: updatedMonitor.status === "breached" ? "threshold_breach" : "status_down",
+										notificationReason: updatedMonitor.status === "breached" ? "threshold_breach" : "status_change",
+									};
+									incident = await this.incidentService.handleIncident(updatedMonitor, statusChangeResult.code, fallbackDecision, status);
+								}
+
+								this.logger.debug({
+									message: `[Escalation] incident=${incident ? incident.id : "none"}`,
+									service: SERVICE_NAME,
+									method: "getHeartbeatJob",
+								});
+								if (!incident) return;
+
+								const minutesDown = (Date.now() - new Date(incident.startTime).getTime()) / 60000;
+								if (minutesDown >= (updatedMonitor.escalationDelay ?? 0)) {
+									this.logger.debug({
+										message: `[Escalation] FIRING escalated notifications for monitor ${monitorId}`,
+										service: SERVICE_NAME,
+										method: "getHeartbeatJob",
+									});
+									const didSendEscalation = await this.notificationsService.handleEscalatedNotifications(updatedMonitor, status, decision);
+
+									if (didSendEscalation) {
+										await this.monitorsRepository.updateById(monitorId, teamId, {
+											escalationSentAt: new Date().toISOString(),
+										});
+									} else {
+										this.logger.warn({
+											message: `[Escalation] Send failed for monitor ${monitorId}; will retry on next check`,
+											service: SERVICE_NAME,
+											method: "getHeartbeatJob",
+										});
+									}
+								}
+							} catch (error: unknown) {
+								this.logger.warn({
+									message: `Error sending escalated notifications for monitor ${monitorId}: ${error instanceof Error ? error.message : "Unknown error"}`,
+									service: SERVICE_NAME,
+									method: "getMonitorJob",
+								});
+							}
+						}
+					} else if (updatedMonitor.status === "up" && updatedMonitor.escalationSentAt) {
+						// Monitor recovered — reset escalation state
+						this.monitorsRepository.updateById(monitorId, teamId, { escalationSentAt: null }).catch(() => {});
+					}
+				}
 			} catch (error: unknown) {
 				this.logger.warn({
 					message: error instanceof Error ? error.message : "Unknown error",
