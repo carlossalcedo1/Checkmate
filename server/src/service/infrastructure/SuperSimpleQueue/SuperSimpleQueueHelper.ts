@@ -200,8 +200,12 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 						if (decision.shouldCreateIncident) {
 							this.monitorsRepository.updateById(monitorId, teamId, { escalationSentAt: null }).catch(() => {});
 						}
-						// Only fire escalated notification if not already sent for this incident
-						if (!updatedMonitor.escalationSentAt) {
+						// Fire escalated notification if never sent, or if escalationDelay minutes have passed since last send
+						const minutesSinceLastEscalation = updatedMonitor.escalationSentAt
+							? (Date.now() - new Date(updatedMonitor.escalationSentAt).getTime()) / 60000
+							: Infinity;
+						const escalationInterval = updatedMonitor.escalationDelay ?? 0;
+						if (!updatedMonitor.escalationSentAt || minutesSinceLastEscalation >= escalationInterval) {
 							try {
 								let incident = activeIncident ?? (await this.incidentsRepository.findActiveByMonitorId(monitorId, teamId));
 
